@@ -1,10 +1,8 @@
 # ============================================================
-# GESTURE → FPGA UART SENDER
+# GESTURE ARM CONTROL → FPGA → ROBOTIC ARM
 # ============================================================
-# Sends finger count (0-5) to Nexys 4 DDR FPGA via UART
-# Uses the built-in FTDI USB-UART on the Nexys 4 DDR board
-#
-# Install: pip install pyserial mediapipe opencv-python
+# Maps real hand/arm movements to robotic arm servo positions
+# Uses MediaPipe pose (for elbow) + hand (for wrist & grip)
 # ============================================================
 
 import cv2
@@ -12,9 +10,10 @@ import numpy as np
 import time
 import serial
 import serial.tools.list_ports
-from collections import deque, Counter
-from enum import Enum, auto
 import threading
+import math
+from collections import deque
+from enum import Enum, auto
 
 # ── MediaPipe ──
 try:
@@ -34,28 +33,75 @@ print("✅ All packages loaded!")
 
 
 # ============================================================
-# UART COMMUNICATION
+# ANGLE CALCULATION UTILITIES
 # ============================================================
-class FPGAUart:
+def calculate_angle(point_a, point_b, point_c):
     """
-    UART communication with Nexys 4 DDR FPGA.
+    Calculate angle at point_b formed by line AB and line BC.
+    
+    Points are (x, y) tuples.
+    Returns angle in degrees (0-180).
+    
+        A
+         \
+          \ angle
+           B ──── C
+    """
+    a = np.array(point_a)
+    b = np.array(point_b)
+    c = np.array(point_c)
 
+    ba = a - b
+    bc = c - b
+
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    cosine = np.clip(cosine, -1.0, 1.0)
+    angle = np.degrees(np.arccos(cosine))
+    return angle
+
+
+def calculate_angle_3d(point_a, point_b, point_c):
+    """
+    Calculate angle at point_b in 3D space.
+    Points are (x, y, z) tuples.
+    """
+    a = np.array(point_a)
+    b = np.array(point_b)
+    c = np.array(point_c)
+
+    ba = a - b
+    bc = c - b
+
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    cosine = np.clip(cosine, -1.0, 1.0)
+    angle = np.degrees(np.arccos(cosine))
+    return angle
+
+
+def map_range(value, in_min, in_max, out_min, out_max):
+    """Map a value from one range to another, clamped."""
+    value = max(in_min, min(in_max, value))
+    return out_min + (value - in_min) * (out_max - out_min) / (in_max - in_min + 1e-6)
+
+
+def smooth_value(current, target, factor=0.3):
+    """Exponential smoothing to reduce jitter."""
+    return current + factor * (target - current)
+
+
+# ============================================================
+# ENHANCED UART FOR ARM CONTROL
+# ============================================================
+class ArmUart:
+    """
+    Extended UART protocol for robotic arm control.
+    
     Protocol (PC → FPGA):
-        Byte format: 0xA<n>  where n = finger count (0-5)
-        Examples:
-            0xA0 = fist    (0 fingers)
-            0xA1 = one     (1 finger)
-            0xA2 = two     (2 fingers)
-            0xA3 = three   (3 fingers)
-            0xA4 = four    (4 fingers)
-            0xA5 = five    (5 fingers)
-            0xAF = no hand detected
-
-        Upper nibble 0xA acts as a sync/header marker.
-        Lower nibble carries the gesture data.
-
-    FPGA → PC (optional acknowledgment):
-        Echoes back the received byte.
+        0xA0-0xAF : Gesture/finger count (existing)
+        0xB0-0xBF : Base rotation     (0-15 → 0°-180°)
+        0xC0-0xCF : Elbow angle       (0-15 → 0°-180°)
+        0xD0-0xDF : Wrist angle        (0-15 → 0°-180°)
+        0xE0-0xEF : Gripper            (0=closed, 15=open)
     """
 
     def __init__(self, port=None, baud=9600):
@@ -63,44 +109,32 @@ class FPGAUart:
         self.connected = False
         self.baud = baud
         self.port = port
-        self.last_sent = None
         self.send_count = 0
+        self.last_sent = {}  # Track last sent value per joint
 
     def find_fpga_port(self):
-        """Auto-detect the Nexys 4 DDR FTDI port."""
         ports = serial.tools.list_ports.comports()
         print("\n📡 Available serial ports:")
         for p in ports:
             print(f"   {p.device}: {p.description} [VID:PID={p.vid}:{p.pid}]")
-            # Digilent/FTDI typically has VID 0x0403
-            if p.vid == 0x0403 or "FTDI" in (p.description or "").upper() or \
-               "Digilent" in (p.description or ""):
-                print(f"   ✅ Likely FPGA port: {p.device}")
+            if p.vid == 0x0403 or "FTDI" in (p.description or "").upper():
                 return p.device
-
-        # If auto-detect fails, list ports for manual selection
         if ports:
-            print(f"\n   ⚠️ Auto-detect failed. Using first port: {ports[0].device}")
             return ports[0].device
         return None
 
     def connect(self):
-        """Connect to the FPGA's UART port."""
         port = self.port or self.find_fpga_port()
         if not port:
-            print("❌ No serial port found! Is the FPGA connected via USB?")
+            print("❌ No serial port found!")
             return False
-
         try:
             self.serial = serial.Serial(
-                port=port,
-                baudrate=self.baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1
+                port=port, baudrate=self.baud,
+                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE, timeout=0.1
             )
-            time.sleep(0.1)  # Let the port settle
+            time.sleep(0.2)
             self.connected = True
             print(f"✅ Connected to FPGA on {port} @ {self.baud} baud")
             return True
@@ -108,40 +142,56 @@ class FPGAUart:
             print(f"❌ Serial error: {e}")
             return False
 
-    def send_gesture(self, finger_count):
+    def send_joint(self, joint_cmd, value_4bit):
         """
-        Send finger count to FPGA.
-        Encodes as: 0xA0-0xA5 for 0-5 fingers, 0xAF for no hand.
+        Send a joint position command.
+        joint_cmd: 0xB0 (base), 0xC0 (elbow), 0xD0 (wrist), 0xE0 (gripper)
+        value_4bit: 0-15
         """
         if not self.connected or not self.serial:
             return False
 
-        if finger_count < 0 or finger_count > 5:
-            data_byte = 0xAF  # No hand / invalid
-        else:
-            data_byte = 0xA0 | (finger_count & 0x0F)
+        value_4bit = max(0, min(15, int(value_4bit)))
+        data_byte = joint_cmd | value_4bit
 
-        # Only send if value changed (reduce UART traffic)
-        if data_byte == self.last_sent:
+        # Only send if value changed for this joint
+        if self.last_sent.get(joint_cmd) == data_byte:
             return True
 
         try:
             self.serial.write(bytes([data_byte]))
-            self.last_sent = data_byte
+            self.last_sent[joint_cmd] = data_byte
             self.send_count += 1
             return True
         except serial.SerialException:
-            print("⚠️ UART write failed")
             self.connected = False
             return False
 
+    def send_base(self, val):
+        return self.send_joint(0xB0, val)
+
+    def send_elbow(self, val):
+        return self.send_joint(0xC0, val)
+
+    def send_wrist(self, val):
+        return self.send_joint(0xD0, val)
+
+    def send_gripper(self, val):
+        return self.send_joint(0xE0, val)
+
+    def send_all(self, base, elbow, wrist, gripper):
+        """Send all joint positions. Only sends if values changed."""
+        self.send_base(base)
+        self.send_elbow(elbow)
+        self.send_wrist(wrist)
+        self.send_gripper(gripper)
+
     def read_ack(self):
-        """Read acknowledgment from FPGA (optional)."""
         if not self.connected or not self.serial:
             return None
         try:
             if self.serial.in_waiting > 0:
-                return self.serial.read(1)
+                return self.serial.read(self.serial.in_waiting)
         except:
             pass
         return None
@@ -154,396 +204,335 @@ class FPGAUart:
 
 
 # ============================================================
-# VOICE ENGINE (from your original code)
+# ARM ANGLE TRACKER
 # ============================================================
-class VoiceEngine:
+class ArmAngleTracker:
+    """
+    Tracks your real arm angles using MediaPipe Pose + Hands.
+    
+    What we track:
+    ┌─────────────────────────────────────────────────┐
+    │  SHOULDER (pose landmark 12)                    │
+    │      │                                          │
+    │      │  ← upper arm                             │
+    │      │                                          │
+    │  ELBOW (pose landmark 14)                       │
+    │      │        ← elbow_angle: angle at elbow     │
+    │      │  ← forearm                               │
+    │      │                                          │
+    │  WRIST (pose landmark 16 / hand landmark 0)     │
+    │      │        ← wrist_angle: angle at wrist     │
+    │      │                                          │
+    │  FINGERS (hand landmarks)                       │
+    │              ← grip: open (0°) or closed (180°) │
+    └─────────────────────────────────────────────────┘
+    """
+
     def __init__(self):
-        self.engine = None
-        self.enabled = VOICE_AVAILABLE
-        self.last_spoken = ""
-        self.last_time = 0
-        self.cooldown = 3.0
-        self.speaking = False
-        if not VOICE_AVAILABLE:
-            return
-        try:
-            self.engine = pyttsx3.init()
-            self.engine.setProperty('rate', 150)
-        except:
-            self.enabled = False
+        # MediaPipe Pose — for shoulder, elbow, wrist positions
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.5
+        )
 
-    def speak(self, text):
-        if not self.enabled or not self.engine or not text:
-            return
-        now = time.time()
-        if text == self.last_spoken and (now - self.last_time) < self.cooldown:
-            return
-        if self.speaking:
-            return
-        self.last_spoken = text
-        self.last_time = now
-        def _r():
-            self.speaking = True
-            try:
-                self.engine.say(text)
-                self.engine.runAndWait()
-            except:
-                pass
-            self.speaking = False
-        threading.Thread(target=_r, daemon=True).start()
-
-
-# ============================================================
-# STATE MACHINE (from your original code — unchanged)
-# ============================================================
-class GestureState(Enum):
-    IDLE = auto()
-    DETECTING = auto()
-    LOCKED = auto()
-    TRANSITIONING = auto()
-    COOLDOWN = auto()
-
-class StableStateMachine:
-    def __init__(self):
-        self.state = GestureState.IDLE
-        self.locked_gesture = -1
-        self.no_hand_count = 0
-        self.locked_frame_count = 0
-        self.vote_window = deque(maxlen=25)
-        self.transition_votes = deque(maxlen=25)
-        self.detect_window = 10
-        self.lock_majority = 0.55
-        self.transition_window = 15
-        self.transition_majority = 0.65
-        self.min_hold_frames = 10
-        self.idle_frames = 20
-        self.cooldown_frames = 6
-        self.cooldown_counter = 0
-
-    def update(self, gesture, hand_detected):
-        if self.state == GestureState.IDLE:
-            if hand_detected and gesture >= 0:
-                self.state = GestureState.DETECTING
-                self.vote_window.clear()
-                self.vote_window.append(gesture)
-                self.no_hand_count = 0
-                return (-1, False, "DETECTING")
-            return (-1, False, "IDLE")
-
-        elif self.state == GestureState.DETECTING:
-            if not hand_detected:
-                self.no_hand_count += 1
-                if self.no_hand_count > 8:
-                    self.state = GestureState.IDLE
-                    self.vote_window.clear()
-                    self.no_hand_count = 0
-                    return (-1, False, "IDLE")
-                return (-1, False, "DETECTING")
-            self.no_hand_count = 0
-            self.vote_window.append(gesture)
-            if len(self.vote_window) >= self.detect_window:
-                mg, r = self._maj(self.vote_window)
-                if r >= self.lock_majority and mg >= 0:
-                    self.locked_gesture = mg
-                    self.locked_frame_count = 0
-                    self.state = GestureState.COOLDOWN
-                    self.cooldown_counter = self.cooldown_frames
-                    return (self.locked_gesture, True, "LOCKED")
-            return (-1, False, "DETECTING")
-
-        elif self.state == GestureState.LOCKED:
-            self.locked_frame_count += 1
-            if not hand_detected:
-                self.no_hand_count += 1
-                if self.no_hand_count > self.idle_frames:
-                    self.state = GestureState.IDLE
-                    self.locked_gesture = -1
-                    self.no_hand_count = 0
-                    self.locked_frame_count = 0
-                    return (-1, False, "IDLE")
-                return (self.locked_gesture, True, "LOCKED")
-            self.no_hand_count = 0
-            if self.locked_frame_count < self.min_hold_frames:
-                return (self.locked_gesture, True, "LOCKED")
-            if gesture != self.locked_gesture:
-                self.state = GestureState.TRANSITIONING
-                self.transition_votes.clear()
-                self.transition_votes.append(gesture)
-                return (self.locked_gesture, True, "TRANSITIONING")
-            return (self.locked_gesture, True, "LOCKED")
-
-        elif self.state == GestureState.TRANSITIONING:
-            if not hand_detected:
-                self.no_hand_count += 1
-                if self.no_hand_count > self.idle_frames:
-                    self.state = GestureState.IDLE
-                    self.locked_gesture = -1
-                    return (-1, False, "IDLE")
-                return (self.locked_gesture, True, "TRANSITIONING")
-            self.no_hand_count = 0
-            self.transition_votes.append(gesture)
-            if len(self.transition_votes) >= 5:
-                mg, r = self._maj(self.transition_votes)
-                if mg == self.locked_gesture and r > 0.4:
-                    self.state = GestureState.LOCKED
-                    self.transition_votes.clear()
-                    return (self.locked_gesture, True, "LOCKED")
-                if (len(self.transition_votes) >= self.transition_window and
-                        r >= self.transition_majority and
-                        mg != self.locked_gesture and mg >= 0):
-                    self.locked_gesture = mg
-                    self.locked_frame_count = 0
-                    self.state = GestureState.COOLDOWN
-                    self.cooldown_counter = self.cooldown_frames
-                    self.transition_votes.clear()
-                    return (self.locked_gesture, True, "LOCKED")
-            return (self.locked_gesture, True, "TRANSITIONING")
-
-        elif self.state == GestureState.COOLDOWN:
-            self.cooldown_counter -= 1
-            if self.cooldown_counter <= 0:
-                self.state = GestureState.LOCKED
-                self.vote_window.clear()
-                self.locked_frame_count = 0
-            return (self.locked_gesture, True, "COOLDOWN")
-
-        return (-1, False, "?")
-
-    def _maj(self, w):
-        if not w:
-            return (-1, 0.0)
-        c = Counter(w)
-        g, n = c.most_common(1)[0]
-        return (g, n / len(w))
-
-    def reset(self):
-        self.state = GestureState.IDLE
-        self.locked_gesture = -1
-        self.no_hand_count = 0
-        self.locked_frame_count = 0
-        self.vote_window.clear()
-        self.transition_votes.clear()
-        self.cooldown_counter = 0
-
-
-# ============================================================
-# MEDIAPIPE HAND DETECTOR (from your original code)
-# ============================================================
-class HandDetector:
-    def __init__(self):
+        # MediaPipe Hands — for finger tracking (grip detection)
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.7,
+            min_detection_confidence=0.6,
             min_tracking_confidence=0.5
         )
+
+        self.mp_draw = mp.solutions.drawing_utils
+
+        # Smoothed values (reduces jitter)
+        self.smooth_elbow = 90.0
+        self.smooth_wrist = 90.0
+        self.smooth_grip = 0.0
+        self.smooth_base = 90.0
+
+        # Finger tip and pip IDs for grip calculation
         self.TIP_IDS = [4, 8, 12, 16, 20]
         self.PIP_IDS = [3, 6, 10, 14, 18]
 
     def process(self, frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
-
-        data = {
-            'detected': False,
-            'landmarks': None,
-            'finger_count': 0,
-            'fingers_up': [False] * 5,
-            'bbox': None,
-            'centroid': None,
-            'handedness': 'Right'
-        }
-
-        if not results.multi_hand_landmarks:
-            return data
-
-        hand_lm = results.multi_hand_landmarks[0]
+        """
+        Process one frame and return arm angles.
+        
+        Returns dict with:
+            elbow_angle:  0-180° (straight=180, fully bent=~30)
+            wrist_angle:  0-180° (extension/flexion)
+            grip_amount:  0-100  (0=open, 100=closed fist)
+            base_angle:   0-180° (left-right position of hand)
+            detected:     True if arm is visible
+        """
         h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if results.multi_handedness:
-            data['handedness'] = results.multi_handedness[0].classification[0].label
+        result = {
+            'detected': False,
+            'elbow_angle': 90,
+            'wrist_angle': 90,
+            'grip_amount': 0,
+            'base_angle': 90,
+            'pose_landmarks': None,
+            'hand_landmarks': None,
+            'hand_data': None
+        }
 
-        lm_pixels = []
-        for lm in hand_lm.landmark:
-            px = int(lm.x * w)
-            py = int(lm.y * h)
-            lm_pixels.append((px, py))
+        # ── POSE DETECTION (shoulder, elbow, wrist) ──
+        pose_results = self.pose.process(rgb)
 
-        data['detected'] = True
-        data['landmarks'] = lm_pixels
+        if pose_results.pose_landmarks:
+            lm = pose_results.pose_landmarks.landmark
+            result['pose_landmarks'] = pose_results.pose_landmarks
 
-        xs = [p[0] for p in lm_pixels]
-        ys = [p[1] for p in lm_pixels]
-        margin = 20
-        data['bbox'] = (
-            max(0, min(xs) - margin), max(0, min(ys) - margin),
-            min(w, max(xs) + margin), min(h, max(ys) + margin)
+            # Get RIGHT arm landmarks (use left arm if you prefer)
+            # Landmark IDs: 11=L shoulder, 12=R shoulder,
+            #               13=L elbow, 14=R elbow,
+            #               15=L wrist, 16=R wrist
+            shoulder = lm[12]  # Right shoulder
+            elbow = lm[14]     # Right elbow
+            wrist = lm[16]     # Right wrist
+
+            # Check visibility
+            if (shoulder.visibility > 0.5 and
+                    elbow.visibility > 0.5 and
+                    wrist.visibility > 0.5):
+
+                result['detected'] = True
+
+                # ── ELBOW ANGLE ──
+                # Angle at the elbow joint (shoulder-elbow-wrist)
+                # Straight arm = ~170°, fully bent = ~30°
+                shoulder_px = (int(shoulder.x * w), int(shoulder.y * h))
+                elbow_px = (int(elbow.x * w), int(elbow.y * h))
+                wrist_px = (int(wrist.x * w), int(wrist.y * h))
+
+                elbow_angle = calculate_angle(shoulder_px, elbow_px, wrist_px)
+                self.smooth_elbow = smooth_value(self.smooth_elbow, elbow_angle, 0.35)
+                result['elbow_angle'] = self.smooth_elbow
+
+                # ── BASE ROTATION ──
+                # Horizontal position of wrist → base rotation
+                # Wrist at left edge = 0°, right edge = 180°
+                # (Remember: frame is flipped, so left in image = your right)
+                base_angle = map_range(wrist.x, 0.2, 0.8, 0, 180)
+                self.smooth_base = smooth_value(self.smooth_base, base_angle, 0.3)
+                result['base_angle'] = self.smooth_base
+
+        # ── HAND DETECTION (wrist angle + grip) ──
+        hand_results = self.hands.process(rgb)
+
+        if hand_results.multi_hand_landmarks:
+            hand_lm = hand_results.multi_hand_landmarks[0]
+            result['hand_landmarks'] = hand_lm
+
+            # Get hand landmarks in pixel coordinates
+            lm_px = []
+            for landmark in hand_lm.landmark:
+                px = int(landmark.x * w)
+                py = int(landmark.y * h)
+                lm_px.append((px, py))
+
+            result['hand_data'] = lm_px
+
+            # ── WRIST ANGLE ──
+            # Angle between forearm direction and hand direction
+            # Use: elbow → wrist → middle_finger_mcp(9)
+            #
+            #   Elbow (from pose)
+            #      \
+            #       \ forearm
+            #        \
+            #    Wrist (landmark 0) ─── angle ─── Middle MCP (landmark 9)
+            #                                        │
+            #                                      hand direction
+
+            if result['detected']:  # Need pose data for elbow position
+                wrist_pt = lm_px[0]       # Hand wrist
+                mid_mcp = lm_px[9]        # Middle finger MCP
+
+                # Use pose elbow as the "forearm origin"
+                pose_lm = pose_results.pose_landmarks.landmark
+                elbow_pt = (int(pose_lm[14].x * w), int(pose_lm[14].y * h))
+
+                wrist_angle = calculate_angle(elbow_pt, wrist_pt, mid_mcp)
+                self.smooth_wrist = smooth_value(self.smooth_wrist, wrist_angle, 0.35)
+                result['wrist_angle'] = self.smooth_wrist
+
+            # ── GRIP AMOUNT ──
+            # Average distance between fingertips and palm center
+            # Closed fist = small distance = 100% grip
+            # Open hand = large distance = 0% grip
+            palm_center = np.mean([lm_px[0], lm_px[5], lm_px[9],
+                                   lm_px[13], lm_px[17]], axis=0)
+
+            # Calculate average tip-to-palm distance
+            tip_distances = []
+            for tip_id in [8, 12, 16, 20]:  # Skip thumb for now
+                tip = np.array(lm_px[tip_id])
+                dist = np.linalg.norm(tip - palm_center)
+                tip_distances.append(dist)
+
+            avg_tip_dist = np.mean(tip_distances)
+
+            # Also check finger curl (tip below pip = curled)
+            fingers_curled = 0
+            for i in range(1, 5):  # Index through pinky
+                tip = lm_px[self.TIP_IDS[i]]
+                pip = lm_px[self.PIP_IDS[i]]
+                if tip[1] > pip[1]:  # tip is BELOW pip = finger curled
+                    fingers_curled += 1
+
+            # Combine distance and curl for robust grip detection
+            # Normalize distance: ~30px = closed, ~120px = open (varies with hand size)
+            grip_from_dist = map_range(avg_tip_dist, 30, 120, 100, 0)
+            grip_from_curl = (fingers_curled / 4.0) * 100
+
+            grip = grip_from_dist * 0.4 + grip_from_curl * 0.6
+            grip = max(0, min(100, grip))
+
+            self.smooth_grip = smooth_value(self.smooth_grip, grip, 0.35)
+            result['grip_amount'] = self.smooth_grip
+
+        return result
+
+
+# ============================================================
+# VISUALIZATION
+# ============================================================
+def draw_arm_display(frame, data, uart):
+    """Draw arm tracking visualization with angle info."""
+    vis = frame.copy()
+    h, w = vis.shape[:2]
+
+    # Draw pose skeleton
+    if data['pose_landmarks']:
+        mp.solutions.drawing_utils.draw_landmarks(
+            vis, data['pose_landmarks'],
+            mp.solutions.pose.POSE_CONNECTIONS,
+            mp.solutions.drawing_utils.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3),
+            mp.solutions.drawing_utils.DrawingSpec(color=(0, 200, 0), thickness=2)
         )
-        data['centroid'] = (sum(xs) // 21, sum(ys) // 21)
 
-        fingers = [False] * 5
-        if data['handedness'] == 'Right':
-            fingers[0] = lm_pixels[4][0] < lm_pixels[3][0]
-        else:
-            fingers[0] = lm_pixels[4][0] > lm_pixels[3][0]
+    # Draw hand landmarks
+    if data['hand_landmarks']:
+        mp.solutions.drawing_utils.draw_landmarks(
+            vis, data['hand_landmarks'],
+            mp.solutions.hands.HAND_CONNECTIONS,
+            mp.solutions.drawing_utils.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2),
+            mp.solutions.drawing_utils.DrawingSpec(color=(255, 255, 0), thickness=2)
+        )
 
-        for i in range(1, 5):
-            tip = lm_pixels[self.TIP_IDS[i]]
-            pip_joint = lm_pixels[self.PIP_IDS[i]]
-            fingers[i] = tip[1] < pip_joint[1]
-
-        data['fingers_up'] = fingers
-        data['finger_count'] = sum(fingers)
-        return data
-
-    def draw_landmarks(self, frame, hand_data):
-        if not hand_data['detected'] or hand_data['landmarks'] is None:
-            return frame
-
-        vis = frame.copy()
-        lm = hand_data['landmarks']
-        connections = [
-            (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
-            (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),
-            (0,17),(17,18),(18,19),(19,20),(5,9),(9,13),(13,17)
-        ]
-        for c in connections:
-            if c[0] < len(lm) and c[1] < len(lm):
-                cv2.line(vis, lm[c[0]], lm[c[1]], (0, 255, 0), 2)
-        for i, pt in enumerate(lm):
-            color = (0, 0, 255) if i == 0 else (0, 255, 255)
-            radius = 6 if i in [4, 8, 12, 16, 20] else 3
-            cv2.circle(vis, pt, radius, color, -1)
-        if hand_data['bbox']:
-            x1, y1, x2, y2 = hand_data['bbox']
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        return vis
-
-
-# ============================================================
-# MAIN RECOGNIZER WITH UART
-# ============================================================
-class GestureRecognizerUART:
-    def __init__(self):
-        self.detector = HandDetector()
-        self.state_machine = StableStateMachine()
-        self.uart = FPGAUart()
-        self.voice = VoiceEngine()
-        self.gesture_names = {
-            -1: "No Hand", 0: "FIST", 1: "ONE",
-            2: "TWO", 3: "THREE", 4: "FOUR", 5: "FIVE"
-        }
-
-    def process_frame(self, frame):
-        hand = self.detector.process(frame)
-        raw = hand['finger_count'] if hand['detected'] else -1
-
-        if hand['detected']:
-            g, s, st = self.state_machine.update(hand['finger_count'], True)
-        else:
-            g, s, st = self.state_machine.update(-1, False)
-
-        return {
-            'hand': hand,
-            'raw_gesture': raw,
-            'stable_gesture': g,
-            'is_stable': s,
-            'state': st
-        }
-
-    def reset(self):
-        self.state_machine.reset()
-
-
-# ============================================================
-# VISUALIZATION WITH UART STATUS
-# ============================================================
-def draw_display(frame, result, rec):
-    vis = rec.detector.draw_landmarks(frame, result['hand'])
-
-    # Info panel
-    cv2.rectangle(vis, (10, 10), (320, 220), (0, 0, 0), -1)
-    cv2.rectangle(vis, (10, 10), (320, 220), (100, 100, 100), 2)
+    # ── Info Panel ──
+    panel_h = 280
+    cv2.rectangle(vis, (10, 10), (350, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(vis, (10, 10), (350, panel_h), (100, 100, 100), 2)
 
     y = 30
-    cv2.putText(vis, "GESTURE -> FPGA (UART)", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+    cv2.putText(vis, "ARM MIRROR -> FPGA -> ROBOT", (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-    y += 25
-    state_colors = {
-        'IDLE': (128,128,128), 'DETECTING': (0,255,255),
-        'LOCKED': (0,255,0), 'TRANSITIONING': (0,165,255),
-        'COOLDOWN': (255,255,0)
-    }
-    cv2.putText(vis, f"State: {result['state']}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                state_colors.get(result['state'], (255,255,255)), 2)
+    y += 30
+    status = "TRACKING" if data['detected'] else "NO ARM DETECTED"
+    color = (0, 255, 0) if data['detected'] else (0, 0, 255)
+    cv2.putText(vis, f"Status: {status}", (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
-    y += 25
-    cv2.putText(vis, f"Raw fingers: {result['raw_gesture']}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+    if data['detected']:
+        # Elbow angle bar
+        y += 30
+        elbow = data['elbow_angle']
+        cv2.putText(vis, f"Elbow:   {elbow:.0f} deg", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        bar_w = int(map_range(elbow, 30, 170, 0, 150))
+        cv2.rectangle(vis, (200, y - 12), (200 + bar_w, y + 2), (0, 200, 255), -1)
 
-    y += 25
-    sg = result['stable_gesture']
-    gn = rec.gesture_names.get(sg, "?")
-    cv2.putText(vis, f"Stable: {gn} ({sg})", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Wrist angle bar
+        y += 30
+        wrist = data['wrist_angle']
+        cv2.putText(vis, f"Wrist:   {wrist:.0f} deg", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        bar_w = int(map_range(wrist, 30, 170, 0, 150))
+        cv2.rectangle(vis, (200, y - 12), (200 + bar_w, y + 2), (255, 200, 0), -1)
 
-    y += 25
-    uart_status = "CONNECTED" if rec.uart.connected else "DISCONNECTED"
-    uart_color = (0, 255, 0) if rec.uart.connected else (0, 0, 255)
-    cv2.putText(vis, f"UART: {uart_status}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, uart_color, 2)
+        # Grip bar
+        y += 30
+        grip = data['grip_amount']
+        grip_label = "CLOSED" if grip > 70 else "OPEN" if grip < 30 else "PARTIAL"
+        cv2.putText(vis, f"Grip:    {grip:.0f}% ({grip_label})", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        bar_w = int(map_range(grip, 0, 100, 0, 150))
+        grip_color = (0, 0, 255) if grip > 70 else (0, 255, 0) if grip < 30 else (0, 255, 255)
+        cv2.rectangle(vis, (200, y - 12), (200 + bar_w, y + 2), grip_color, -1)
 
-    y += 25
-    if rec.uart.connected:
-        sent_hex = f"0x{rec.uart.last_sent:02X}" if rec.uart.last_sent else "---"
-        cv2.putText(vis, f"Last TX: {sent_hex}  (#{rec.uart.send_count})", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        # Base rotation bar
+        y += 30
+        base = data['base_angle']
+        cv2.putText(vis, f"Base:    {base:.0f} deg", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        bar_w = int(map_range(base, 0, 180, 0, 150))
+        cv2.rectangle(vis, (200, y - 12), (200 + bar_w, y + 2), (200, 100, 255), -1)
 
-    y += 25
-    if result['is_stable']:
-        cv2.putText(vis, ">> FPGA ACTIVE <<", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-    else:
-        cv2.putText(vis, "... stabilizing ...", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    # UART status
+    y += 30
+    uart_status = "CONNECTED" if uart.connected else "DISCONNECTED"
+    uart_color = (0, 255, 0) if uart.connected else (0, 0, 255)
+    cv2.putText(vis, f"UART: {uart_status}  (#{uart.send_count})", (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, uart_color, 1)
+
+    # ── Draw angle arcs on the body ──
+    if data['detected'] and data['pose_landmarks']:
+        lm = data['pose_landmarks'].landmark
+
+        # Draw elbow angle arc
+        elbow_px = (int(lm[14].x * w), int(lm[14].y * h))
+        cv2.putText(vis, f"{data['elbow_angle']:.0f}", 
+                    (elbow_px[0] + 10, elbow_px[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
     return vis
 
 
 # ============================================================
-# MAIN ENTRY POINT
+# MAIN — ARM MIRROR MODE
 # ============================================================
-def start(seconds=120, port=None, baud=9600):
+def start_arm_mirror(seconds=300, port=None, baud=9600):
     """
-    Start gesture recognition with FPGA UART output.
-
-    Args:
-        seconds:  Duration in seconds (default 120)
-        port:     Serial port (auto-detect if None)
-                  Windows: 'COM3', 'COM4', etc.
-                  Linux:   '/dev/ttyUSB0', '/dev/ttyUSB1'
-                  Mac:     '/dev/tty.usbserial-xxxxx'
-        baud:     Baud rate (must match FPGA, default 9600)
+    Start arm mirroring mode.
+    
+    Your real arm movements are tracked and sent to the FPGA,
+    which drives servo motors to mirror your movements.
+    
+    Controls:
+        - Move your right arm → robot arm follows
+        - Bend elbow → robot elbow bends
+        - Tilt wrist → robot wrist tilts
+        - Close fist → robot gripper closes
+        - Open hand → robot gripper opens
+        - Move hand left/right → robot base rotates
+    
+    Keys:
+        ESC = quit
+        R   = reset/recalibrate
     """
     print("=" * 60)
-    print("🤖 GESTURE → FPGA (Nexys 4 DDR) via UART")
+    print("🤖 ARM MIRROR MODE → FPGA → ROBOTIC ARM")
     print(f"   Baud: {baud}, Duration: {seconds}s")
     print("=" * 60)
+    print("\n   Move your RIGHT arm in front of the camera!")
+    print("   The robot will mirror your movements.\n")
 
-    rec = GestureRecognizerUART()
+    tracker = ArmAngleTracker()
+    uart = ArmUart(port=port, baud=baud)
 
-    # Connect UART
-    rec.uart.port = port
-    rec.uart.baud = baud
-    if not rec.uart.connect():
-        print("\n⚠️  Running WITHOUT FPGA (display only mode)")
-        print("    Connect FPGA and restart, or specify port manually:")
-        print("    start(port='COM3')  # Windows")
-        print("    start(port='/dev/ttyUSB1')  # Linux")
-        # Continue anyway for testing without FPGA
+    if not uart.connect():
+        print("\n⚠️  Running WITHOUT FPGA (preview mode)")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -552,16 +541,12 @@ def start(seconds=120, port=None, baud=9600):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    rec.reset()
-    rec.voice.speak("Ready. Show your hand.")
-
     t0 = time.time()
     frame_count = 0
-    last_announced = -1
-    last_uart_gesture = -2  # Track what we last sent
-    arm_log = []
     fps_timer = time.time()
     fps = 0
+    send_timer = time.time()
+    SEND_INTERVAL = 0.05 
 
     try:
         while time.time() - t0 < seconds:
@@ -570,86 +555,69 @@ def start(seconds=120, port=None, baud=9600):
                 break
             frame = cv2.flip(frame, 1)
 
-            # Process gesture
-            result = rec.process_frame(frame)
-            sg = result['stable_gesture']
+            # Track arm angles
+            data = tracker.process(frame)
 
-            # ── Send to FPGA via UART ──
-            if result['is_stable'] and sg >= 0:
-                rec.uart.send_gesture(sg)
+            # ── Send to FPGA at controlled rate ──
+            now = time.time()
+            if data['detected'] and (now - send_timer) >= SEND_INTERVAL:
+                send_timer = now
 
-                if sg != last_announced:
-                    name = rec.gesture_names.get(sg, "?")
-                    rec.voice.speak(name)
-                    print(f"📤 UART TX: 0x{0xA0 | sg:02X} → {name} ({sg} fingers)")
-                    last_announced = sg
-                    arm_log.append({
-                        't': time.time() - t0,
-                        'g': sg,
-                        'n': name
-                    })
-            elif not result['is_stable'] and not result['hand']['detected']:
-                # Send "no hand" to FPGA
-                rec.uart.send_gesture(-1)
+                # Map angles to 0-15 range for UART protocol
+                # Elbow: 30°-170° → 0-15
+                elbow_val = int(map_range(data['elbow_angle'], 30, 170, 0, 15))
 
-            # Check for FPGA acknowledgment
-            ack = rec.uart.read_ack()
-            if ack:
-                print(f"   📥 FPGA ACK: 0x{ack[0]:02X}")
+                # Wrist: 30°-170° → 0-15
+                wrist_val = int(map_range(data['wrist_angle'], 30, 170, 0, 15))
 
-            # Draw visualization
-            vis = draw_display(frame, result, rec)
+                # Gripper: 0-100% → 15(open) to 0(closed)
+                grip_val = int(map_range(data['grip_amount'], 0, 100, 15, 0))
 
-            # FPS
+                # Base: 0°-180° → 0-15
+                base_val = int(map_range(data['base_angle'], 0, 180, 0, 15))
+
+                uart.send_all(base_val, elbow_val, wrist_val, grip_val)
+
+           
+            uart.read_ack()
+
+          
+            vis = draw_arm_display(frame, data, uart)
+
+            
             frame_count += 1
-            if time.time() - fps_timer > 1.0:
-                fps = frame_count / (time.time() - fps_timer + 0.001)
-                fps_timer = time.time()
+            if now - fps_timer > 1.0:
+                fps = frame_count / (now - fps_timer + 0.001)
+                fps_timer = now
                 frame_count = 0
-
             cv2.putText(vis, f"FPS: {fps:.0f}", (vis.shape[1] - 100, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # Display
-            try:
-                from IPython.display import display, Image, clear_output
-                _, enc = cv2.imencode('.jpg', vis)
-                clear_output(wait=True)
-                display(Image(data=enc.tobytes()))
-            except ImportError:
-                cv2.imshow('Gesture → FPGA', vis)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
+        
+            cv2.imshow('Arm Mirror -> FPGA -> Robot', vis)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                break
+            elif key == ord('r'):  # Reset
+                tracker = ArmAngleTracker()
+                print("🔄 Reset!")
 
     except KeyboardInterrupt:
         print("\n🛑 Stopped!")
     finally:
         cap.release()
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
-        rec.uart.disconnect()
-        rec.voice.speak("Stopped.")
+        cv2.destroyAllWindows()
+        uart.disconnect()
 
-    # Summary
     print(f"\n{'=' * 60}")
-    print(f"📊 UART sent {rec.uart.send_count} packets, {len(arm_log)} gesture changes")
-    for e in arm_log:
-        print(f"   t={e['t']:.1f}s → {e['n']} ({e['g']})")
+    print(f"📊 UART sent {uart.send_count} packets")
     print("=" * 60)
 
-
-# ============================================================
-# READY
-# ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 GESTURE → FPGA UART SENDER READY!")
+    print("🤖 ARM MIRROR MODE READY!")
     print("=" * 60)
-    print("\n   start()                  # Auto-detect port")
-    print("   start(port='COM3')       # Windows")
-    print("   start(port='/dev/ttyUSB1')  # Linux")
-    print("   start(baud=115200)       # Faster baud")
+    print("\n   start_arm_mirror()                  # Auto-detect port")
+    print("   start_arm_mirror(port='COM4')       # Specify port")
     print("=" * 60)
-    start()
+    start_arm_mirror()
